@@ -7,10 +7,10 @@ edition = "2024"
 too_many_arguments = "allow"
 
 [dependencies]
-async-channel = "2.5.0"
 bevy = { version = "0.17", default-features = false, features = [
 	"bevy_render",
 ] }
+encase = "0.11.2" # match bevy_render
 
 [dev-dependencies]
 bevy = { version = "0.17", features = ["track_location"] }

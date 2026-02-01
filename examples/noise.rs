@@ -1,6 +1,7 @@
 use bevy::color::palettes::{css, tailwind};
 use bevy::pbr::wireframe::{WireframeConfig, WireframePlugin};
 use bevy::prelude::*;
+use bevy::shader::ShaderRef;
 use bevy_marching_cubes::*;
 
 fn main() {
@@ -24,7 +25,7 @@ fn main() {
 #[derive(TypePath)]
 struct MyComputeSampler;
 impl ChunkComputeShader for MyComputeSampler {
-    fn shader_path() -> String {
+    fn shader() -> ShaderRef {
         "sample.wgsl".into()
     }
 }

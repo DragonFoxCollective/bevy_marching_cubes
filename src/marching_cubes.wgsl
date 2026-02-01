@@ -155,14 +155,12 @@ fn main(
 	for (var i = 0; i < 15; i++) {
 		// If edge index is -1, then no further vertices exist in this configuration
 		let edge_index = edge_indices[i];
-
-		num_vertices_for_triangles += 1;
-		num_vertices += 1;
-
 		if edge_index == -1 { break; }
+		num_vertices_for_triangles += 1;
 
 		// If the edge has already been created, skip it.
 		if edge_vertices_created[edge_index] { continue; }
+		num_vertices += 1;
 
 		// Get indices of the two corner points defining the edge that the surface passes through.
 		let coord_a = vec3<i32>(coord) + CORNER_COORDS[CORNER_INDEX_A_FROM_EDGE[edge_index]];
