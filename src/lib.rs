@@ -23,6 +23,7 @@ use bevy::render::renderer::{RenderContext, RenderDevice, RenderQueue};
 use bevy::render::storage::{GpuShaderStorageBuffer, ShaderStorageBuffer};
 use bevy::render::{MainWorld, Render, RenderApp, RenderStartup, RenderSystems};
 use bevy::shader::ShaderRef;
+use encase::internal::WriteInto;
 
 struct MarchingCubesGlobalPlugin;
 
@@ -42,11 +43,13 @@ impl Plugin for MarchingCubesGlobalPlugin {
     }
 }
 
-pub struct MarchingCubesPlugin<Sampler, Material> {
-    _marker: std::marker::PhantomData<(Sampler, Material)>,
+pub struct MarchingCubesPlugin<Sampler, ExtraBufferCache, Material> {
+    _marker: std::marker::PhantomData<(Sampler, ExtraBufferCache, Material)>,
 }
 
-impl<Sampler, Material> Default for MarchingCubesPlugin<Sampler, Material> {
+impl<Sampler, ExtraBufferCache, Material> Default
+    for MarchingCubesPlugin<Sampler, ExtraBufferCache, Material>
+{
     fn default() -> Self {
         Self {
             _marker: std::marker::PhantomData,
@@ -54,8 +57,11 @@ impl<Sampler, Material> Default for MarchingCubesPlugin<Sampler, Material> {
     }
 }
 
-impl<Sampler: ChunkComputeShader + Send + Sync + 'static, Material: Asset + bevy::prelude::Material>
-    Plugin for MarchingCubesPlugin<Sampler, Material>
+impl<
+    Sampler: ChunkComputeShader + Send + Sync + 'static,
+    ExtraBufferCache: GpuExtraBufferCache + Send + Sync + 'static,
+    Material: Asset + bevy::prelude::Material,
+> Plugin for MarchingCubesPlugin<Sampler, ExtraBufferCache, Material>
 {
     fn build(&self, app: &mut App) {
         if !app.is_plugin_added::<MarchingCubesGlobalPlugin>() {
@@ -73,7 +79,7 @@ impl<Sampler: ChunkComputeShader + Send + Sync + 'static, Material: Asset + bevy
                 (
                     update_chunk_loaders::<Sampler>,
                     queue_chunks::<Sampler>,
-                    start_chunks::<Sampler, Material>.run_if(
+                    start_chunks::<Sampler, ExtraBufferCache, Material>.run_if(
                         |done_loading: If<
                             Res<ChunkGeneratorComputePipelinesDoneLoading<Sampler>>,
                         >| done_loading.done,
@@ -90,11 +96,11 @@ impl<Sampler: ChunkComputeShader + Send + Sync + 'static, Material: Asset + bevy
         };
         render_app
             .init_resource::<ChunkGeneratorComputePipelinesDoneLoading<Sampler>>()
-            .init_resource::<GpuChunkGeneratorCache<Sampler>>()
+            .init_resource::<GpuChunkGeneratorCache<Sampler, ExtraBufferCache>>()
             .add_systems(ExtractSchedule, extract_pipelines_done::<Sampler>)
             .add_systems(
                 Render, // RenderStartup
-                init_compute_pipelines::<Sampler>
+                init_compute_pipelines::<Sampler, ExtraBufferCache>
                     .run_if(resource_exists::<ChunkGeneratorSettings<Sampler>>) // Might not exist on the first frame due to extraction
                     .run_if(not(resource_exists::<
                         ChunkGeneratorComputePipelines<Sampler>,
@@ -103,13 +109,23 @@ impl<Sampler: ChunkComputeShader + Send + Sync + 'static, Material: Asset + bevy
             .add_systems(
                 Render,
                 (
-                    clear_gpu_cache::<Sampler>,
-                    Sampler::prepare_extra_buffers(),
-                    prepare_bind_groups::<Sampler>,
+                    clear_gpu_cache::<Sampler, ExtraBufferCache>,
+                    check_pipelines::<Sampler>,
+                    (
+                        calc_needed_buffers::<Sampler, ExtraBufferCache>,
+                        ExtraBufferCache::create_extra_buffers(),
+                        ExtraBufferCache::clear_extra_buffers(),
+                        prepare_bind_groups::<Sampler, ExtraBufferCache>,
+                    )
+                        .chain()
+                        .run_if(
+                            |pipelines_done_loading: If<
+                                Res<ChunkGeneratorComputePipelinesDoneLoading<Sampler>>,
+                            >| pipelines_done_loading.done,
+                        ),
                 )
                     .chain()
-                    .in_set(RenderSystems::PrepareBindGroups)
-                    .run_if(resource_exists::<ChunkGeneratorComputePipelines<Sampler>>),
+                    .in_set(RenderSystems::PrepareBindGroups),
             );
     }
 }
@@ -162,7 +178,7 @@ impl render_graph::Node for ChunkGeneratorNode {
     ) -> Result<(), render_graph::NodeRunError> {
         let dispatches = world.resource::<ChunkGeneratorDispatches>();
         let pipeline_cache = world.resource::<PipelineCache>();
-        info!("Rendering {} chunks", dispatches.dispatches.len());
+        trace!("Rendering {} chunks", dispatches.dispatches.len());
 
         for dispatch in dispatches.dispatches.iter() {
             let sample_pipeline = pipeline_cache
@@ -222,17 +238,20 @@ struct ChunkGeneratorComputePipelines<Sampler> {
     _marker: std::marker::PhantomData<Sampler>,
 }
 
-fn init_compute_pipelines<Sampler: ChunkComputeShader + Send + Sync + 'static>(
+fn init_compute_pipelines<
+    Sampler: ChunkComputeShader + Send + Sync + 'static,
+    ExtraBufferCache: GpuExtraBufferCache + Send + Sync + 'static,
+>(
     mut commands: Commands,
     render_device: Res<RenderDevice>,
     asset_server: Res<AssetServer>,
     pipeline_cache: Res<PipelineCache>,
     settings: Res<ChunkGeneratorSettings<Sampler>>,
-    mut pipelines_done_loading_res: ResMut<ChunkGeneratorComputePipelinesDoneLoading<Sampler>>,
+    mut pipelines_done_loading: ResMut<ChunkGeneratorComputePipelinesDoneLoading<Sampler>>,
 ) -> Result<()> {
-    info!("Init compute pipelines");
+    trace!("Init compute pipelines");
 
-    pipelines_done_loading_res.done = false;
+    pipelines_done_loading.done = false;
 
     let sample_layout = render_device.create_bind_group_layout(
         "marching cubes sample bind group layout",
@@ -242,7 +261,7 @@ fn init_compute_pipelines<Sampler: ChunkComputeShader + Send + Sync + 'static>(
             storage_buffer::<Vec<f32>>(false),
         ]
         .into_iter()
-        .chain(Sampler::define_extra_buffers())
+        .chain(ExtraBufferCache::define_extra_buffers())
         .enumerate()
         .map(|(i, b)| b.build(i as u32, ShaderStages::COMPUTE))
         .collect::<Vec<_>>(),
@@ -295,13 +314,6 @@ fn init_compute_pipelines<Sampler: ChunkComputeShader + Send + Sync + 'static>(
 
 pub trait ChunkComputeShader {
     fn shader() -> ShaderRef;
-    // TODO: needs to be cached. currently runs every frame, only being *used* if the bindgroups get rebuilt
-    fn prepare_extra_buffers() -> ScheduleConfigs<ScheduleSystem> {
-        IntoSystem::into_system(|| {}).into_configs()
-    }
-    fn define_extra_buffers() -> Vec<BindGroupLayoutEntryBuilder> {
-        vec![]
-    }
 }
 
 #[derive(Component, Debug)]
@@ -320,7 +332,14 @@ struct ChunkGenData {
 pub struct ChunkRenderData<Sampler: Send + Sync + 'static> {
     position: IVec3,
     buffers: BufferCache,
+    num_readbacks_done: usize,
     _marker: std::marker::PhantomData<Sampler>,
+}
+
+impl<Sampler: Send + Sync + 'static> ChunkRenderData<Sampler> {
+    pub fn buffers(&self) -> &BufferCache {
+        &self.buffers
+    }
 }
 
 impl<Sampler: Send + Sync + 'static> Clone for ChunkRenderData<Sampler> {
@@ -328,20 +347,24 @@ impl<Sampler: Send + Sync + 'static> Clone for ChunkRenderData<Sampler> {
         Self {
             position: self.position,
             buffers: self.buffers.clone(),
+            num_readbacks_done: self.num_readbacks_done,
             _marker: self._marker,
         }
     }
 }
 
+#[derive(Component, Debug, Default)]
+struct ChunkThisFrame;
+
 #[derive(Component, Default, Debug)]
 pub struct ChunkLoader<T> {
     pub position: IVec3,
-    pub loading_radius: i32,
+    pub loading_radius: u32,
     _marker: std::marker::PhantomData<T>,
 }
 
 impl<T> ChunkLoader<T> {
-    pub fn new(loading_radius: i32) -> Self {
+    pub fn new(loading_radius: u32) -> Self {
         Self {
             position: IVec3::ZERO,
             loading_radius,
@@ -609,10 +632,10 @@ impl<Sampler: Send + Sync + 'static> ChunkGeneratorCache<Sampler> {
         chunks.zip(buffers)
     }
 
-    fn return_buffer(&mut self, buffer_cache: &BufferCache) {
-        if self.buffer_cache.contains_key(buffer_cache) {
+    fn return_buffer(&mut self, buffer_cache: BufferCache) {
+        if self.buffer_cache.contains_key(&buffer_cache) {
             self.buffer_cache
-                .insert(buffer_cache.clone(), BufferCacheAvailable::Available);
+                .insert(buffer_cache, BufferCacheAvailable::Available);
         }
     }
 }
@@ -624,7 +647,7 @@ pub enum LoadState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct BufferCache {
+pub struct BufferCache {
     vertices: Handle<ShaderStorageBuffer>,
     num_vertices: Handle<ShaderStorageBuffer>,
     triangles: Handle<ShaderStorageBuffer>,
@@ -674,16 +697,65 @@ enum BufferCacheAvailable {
     Unavailable,
 }
 
+pub trait GpuExtraBufferCache {
+    fn define_extra_buffers() -> Vec<BindGroupLayoutEntryBuilder>;
+    fn create_extra_buffers() -> ScheduleConfigs<ScheduleSystem>;
+    fn clear_extra_buffers() -> ScheduleConfigs<ScheduleSystem>;
+    fn buffers(&self) -> Vec<Buffer>;
+    /// The number of times [ReadbackReallyComplete] will be triggered by extra buffers
+    fn num_extra_readbacks() -> usize;
+}
+
+impl GpuExtraBufferCache for () {
+    fn define_extra_buffers() -> Vec<BindGroupLayoutEntryBuilder> {
+        vec![]
+    }
+    fn create_extra_buffers() -> ScheduleConfigs<ScheduleSystem> {
+        IntoSystem::into_system(|| {}).into_configs()
+    }
+    fn clear_extra_buffers() -> ScheduleConfigs<ScheduleSystem> {
+        IntoSystem::into_system(|| {}).into_configs()
+    }
+    fn buffers(&self) -> Vec<Buffer> {
+        vec![]
+    }
+    fn num_extra_readbacks() -> usize {
+        0
+    }
+}
+
 #[derive(Resource, Debug, Clone)]
-pub struct GpuChunkGeneratorCache<Sampler> {
+pub struct GpuChunkGeneratorCache<Sampler, ExtraBufferCache> {
     buffer_cache: HashMap<BufferCache, GpuBufferCache>,
+    extra_buffer_cache: HashMap<BufferCache, ExtraBufferCache>,
+    extra_buffer_needed_keys: Vec<BufferCache>,
     _marker: std::marker::PhantomData<Sampler>,
 }
 
-impl<Sampler> Default for GpuChunkGeneratorCache<Sampler> {
+impl<Sampler, ExtraBufferCache> GpuChunkGeneratorCache<Sampler, ExtraBufferCache> {
+    pub fn drain_needed_extra_buffers(&mut self) -> Vec<BufferCache> {
+        self.extra_buffer_needed_keys.drain(..).collect()
+    }
+}
+
+impl<Sampler, ExtraBufferCache: GpuExtraBufferCache>
+    GpuChunkGeneratorCache<Sampler, ExtraBufferCache>
+{
+    pub fn insert_extra_buffers(&mut self, key: BufferCache, buffers: ExtraBufferCache) {
+        self.extra_buffer_cache.insert(key, buffers);
+    }
+
+    pub fn extra_buffers_mut(&mut self) -> impl Iterator<Item = &mut ExtraBufferCache> {
+        self.extra_buffer_cache.values_mut()
+    }
+}
+
+impl<Sampler, ExtraBufferCache> Default for GpuChunkGeneratorCache<Sampler, ExtraBufferCache> {
     fn default() -> Self {
         Self {
             buffer_cache: default(),
+            extra_buffer_cache: default(),
+            extra_buffer_needed_keys: default(),
             _marker: default(),
         }
     }
@@ -703,7 +775,7 @@ struct GpuBufferCache {
 impl GpuBufferCache {
     fn new<Sampler: Send + Sync + 'static>(
         chunk: &ChunkRenderData<Sampler>,
-        extra_buffers: Option<&ChunkRenderExtraBuffers>,
+        extra_buffers: Option<Vec<Buffer>>,
         settings: &ChunkGeneratorSettings<Sampler>,
         render_device: &RenderDevice,
         render_queue: &RenderQueue,
@@ -751,8 +823,7 @@ impl GpuBufferCache {
             .into_iter()
             .chain(
                 extra_buffers
-                    .map(|b| &b.buffers)
-                    .unwrap_or(&vec![])
+                    .unwrap_or(vec![])
                     .iter()
                     .map(|b| b.as_entire_binding()),
             )
@@ -789,6 +860,9 @@ impl GpuBufferCache {
     }
 }
 
+#[derive(Event)]
+pub struct ClearBufferCache<Sampler>(std::marker::PhantomData<Sampler>);
+
 fn init_cache<Sampler: Send + Sync + 'static>(
     mut commands: Commands,
     mut settings: ResMut<ChunkGeneratorSettings<Sampler>>,
@@ -800,11 +874,8 @@ fn init_cache<Sampler: Send + Sync + 'static>(
         ChunkGeneratorRunning::Stop | ChunkGeneratorRunning::Reset
     );
 
-    if matches!(
-        settings.running,
-        ChunkGeneratorRunning::Stop | ChunkGeneratorRunning::Reset
-    ) && cache.is_some()
-    {
+    if settings.clear_gpu_cache {
+        commands.trigger(ClearBufferCache::<Sampler>(default()));
         commands.remove_resource::<ChunkGeneratorCache<Sampler>>();
     }
 
@@ -850,9 +921,10 @@ fn queue_chunks<Sampler: ChunkComputeShader + Send + Sync + 'static>(
 ) {
     for chunk_loader in chunk_loaders.iter() {
         let mut load_order = Vec::new();
-        for x in -chunk_loader.loading_radius..=chunk_loader.loading_radius {
-            for y in -chunk_loader.loading_radius..=chunk_loader.loading_radius {
-                for z in -chunk_loader.loading_radius..=chunk_loader.loading_radius {
+        let loading_radius = chunk_loader.loading_radius as i32;
+        for x in -loading_radius..=loading_radius {
+            for y in -loading_radius..=loading_radius {
+                for z in -loading_radius..=loading_radius {
                     load_order.push(Vec3::new(x as f32, y as f32, z as f32));
                 }
             }
@@ -872,7 +944,7 @@ fn queue_chunks<Sampler: ChunkComputeShader + Send + Sync + 'static>(
                     .loaded_chunks
                     .insert(chunk_position, LoadState::Loading);
                 cache.chunks_to_load.push(chunk_position);
-                info!("Queued chunk for loading: {chunk_position:?}");
+                trace!("Queued chunk for loading: {chunk_position:?}");
             }
         }
     }
@@ -880,6 +952,7 @@ fn queue_chunks<Sampler: ChunkComputeShader + Send + Sync + 'static>(
 
 fn start_chunks<
     Sampler: ChunkComputeShader + Send + Sync + 'static,
+    ExtraBufferCache: GpuExtraBufferCache + Send + Sync + 'static,
     Material: Asset + bevy::prelude::Material,
 >(
     mut commands: Commands,
@@ -888,7 +961,7 @@ fn start_chunks<
     material: Res<ChunkMaterial<Sampler, Material>>,
 ) {
     for (chunk_position, buffers) in cache.drain_chunks_to_load() {
-        info!("start_chunks {chunk_position:?}");
+        trace!("start_chunks {chunk_position:?}");
 
         let chunk_entity = commands
             .spawn((
@@ -906,10 +979,11 @@ fn start_chunks<
                 ChunkRenderData::<Sampler> {
                     position: chunk_position,
                     buffers: buffers.clone(),
+                    num_readbacks_done: 0,
                     _marker: default(),
                 },
             ))
-            .observe(finish_chunk::<Sampler>)
+            .observe(finish_chunk::<Sampler, ExtraBufferCache>)
             .id();
 
         commands
@@ -925,7 +999,7 @@ fn start_chunks<
                       -> Result {
                     let mut chunk = chunks.get_mut(chunk_entity)?;
                     let num_vertices: u32 = readback.to_shader_type();
-                    info!("num_vertices readback {chunk_position:?} {num_vertices}");
+                    trace!("num_vertices readback {chunk_position:?} {num_vertices}");
                     commands.entity(readback.entity).despawn();
                     if num_vertices > 0 {
                         commands
@@ -944,7 +1018,7 @@ fn start_chunks<
                                       mut commands: Commands|
                                       -> Result {
                                     let vertices: Vec<Vertex> = readback.to_shader_type();
-                                    info!(
+                                    trace!(
                                         "vertices readback {chunk_position:?} {}",
                                         vertices.len()
                                     );
@@ -976,7 +1050,7 @@ fn start_chunks<
                       -> Result {
                     let mut chunk = chunks.get_mut(chunk_entity)?;
                     let num_triangles: u32 = readback.to_shader_type();
-                    info!("num_triangles readback {chunk_position:?} {num_triangles}");
+                    trace!("num_triangles readback {chunk_position:?} {num_triangles}");
                     commands.entity(readback.entity).despawn();
                     if num_triangles > 0 {
                         commands
@@ -995,7 +1069,7 @@ fn start_chunks<
                                       mut commands: Commands|
                                       -> Result {
                                     let triangles: Vec<Triangle> = readback.to_shader_type();
-                                    info!(
+                                    trace!(
                                         "triangles readback {chunk_position:?} {}",
                                         triangles.len()
                                     );
@@ -1016,50 +1090,85 @@ fn start_chunks<
     }
 }
 
-#[derive(Component)]
-pub struct ChunkRenderExtraBuffers {
-    pub buffers: Vec<Buffer>,
-}
-
 fn clear_old_dispatches(mut dispatches: ResMut<ChunkGeneratorDispatches>) {
     dispatches.dispatches.clear();
 }
 
-fn prepare_bind_groups<Sampler: ChunkComputeShader + Send + Sync + 'static>(
-    render_device: Res<RenderDevice>,
-    render_queue: Res<RenderQueue>,
-    chunks: Query<(&ChunkRenderData<Sampler>, Option<&ChunkRenderExtraBuffers>)>,
-    buffers: Res<RenderAssets<GpuShaderStorageBuffer>>,
-    settings: Res<ChunkGeneratorSettings<Sampler>>,
-    pipelines: Res<ChunkGeneratorComputePipelines<Sampler>>,
+fn check_pipelines<Sampler: Send + Sync + 'static>(
+    pipelines: Option<Res<ChunkGeneratorComputePipelines<Sampler>>>,
     pipeline_cache: Res<PipelineCache>,
-    mut dispatches: ResMut<ChunkGeneratorDispatches>,
-    mut cache: ResMut<GpuChunkGeneratorCache<Sampler>>,
-    mut pipelines_done_loading_res: ResMut<ChunkGeneratorComputePipelinesDoneLoading<Sampler>>,
+    mut pipelines_done_loading: ResMut<ChunkGeneratorComputePipelinesDoneLoading<Sampler>>,
+) {
+    pipelines_done_loading.done = pipelines.is_some_and(|pipelines| {
+        pipeline_cache
+            .get_compute_pipeline(pipelines.sample_pipeline)
+            .is_some()
+            && pipeline_cache
+                .get_compute_pipeline(pipelines.march_pipeline)
+                .is_some()
+    });
+}
+
+fn calc_needed_buffers<
+    Sampler: ChunkComputeShader + Send + Sync + 'static,
+    ExtraBufferCache: GpuExtraBufferCache + Send + Sync + 'static,
+>(
+    chunks: Query<(Entity, &ChunkRenderData<Sampler>)>,
+    settings: Res<ChunkGeneratorSettings<Sampler>>,
+    mut cache: ResMut<GpuChunkGeneratorCache<Sampler, ExtraBufferCache>>,
     mut processed: Local<HashSet<IVec3>>,
+    mut commands: Commands,
 ) -> Result<()> {
-    let pipelines_done_loading = pipeline_cache
-        .get_compute_pipeline(pipelines.sample_pipeline)
-        .is_some()
-        && pipeline_cache
-            .get_compute_pipeline(pipelines.march_pipeline)
-            .is_some();
-    pipelines_done_loading_res.done = pipelines_done_loading;
-    if !pipelines_done_loading {
-        return Ok(());
+    if settings.clear_gpu_cache {
+        processed.clear();
     }
 
-    for (chunk, extra_buffers) in chunks.iter() {
+    for (entity, chunk) in chunks.iter() {
         if processed.contains(&chunk.position) {
             continue;
         }
         processed.insert(chunk.position);
 
-        info!(
+        trace!(
+            "calc_needed_buffers {} {}",
+            ShortName::of::<Sampler>(),
+            chunk.position
+        );
+
+        commands.entity(entity).insert(ChunkThisFrame);
+
+        if !cache.extra_buffer_cache.contains_key(&chunk.buffers) {
+            cache.extra_buffer_needed_keys.push(chunk.buffers.clone());
+        }
+    }
+
+    Ok(())
+}
+
+fn prepare_bind_groups<
+    Sampler: ChunkComputeShader + Send + Sync + 'static,
+    ExtraBufferCache: GpuExtraBufferCache + Send + Sync + 'static,
+>(
+    render_device: Res<RenderDevice>,
+    render_queue: Res<RenderQueue>,
+    chunks: Query<&ChunkRenderData<Sampler>, With<ChunkThisFrame>>,
+    buffers: Res<RenderAssets<GpuShaderStorageBuffer>>,
+    settings: Res<ChunkGeneratorSettings<Sampler>>,
+    pipelines: Res<ChunkGeneratorComputePipelines<Sampler>>,
+    mut dispatches: ResMut<ChunkGeneratorDispatches>,
+    mut cache: ResMut<GpuChunkGeneratorCache<Sampler, ExtraBufferCache>>,
+) -> Result<()> {
+    for chunk in chunks.iter() {
+        let extra_buffers = cache
+            .extra_buffer_cache
+            .get(&chunk.buffers)
+            .map(|b| b.buffers());
+
+        trace!(
             "prepare_bind_groups {} {} with {:?} extra buffers, currently {} buffer sets loaded",
             ShortName::of::<Sampler>(),
             chunk.position,
-            extra_buffers.map(|b| b.buffers.len()),
+            extra_buffers.as_ref().map(|b| b.len()),
             cache.buffer_cache.len()
         );
 
@@ -1079,19 +1188,15 @@ fn prepare_bind_groups<Sampler: ChunkComputeShader + Send + Sync + 'static>(
             })
             .clone();
 
-        let mut writer = encase::StorageBuffer::<Vec<u8>>::new(Vec::new());
-        writer.write(&chunk.position)?;
-        render_queue.write_buffer(&buffer_cache.chunk_position_buffer, 0, writer.as_ref());
-
-        let mut writer = encase::StorageBuffer::<Vec<u8>>::new(Vec::new());
-        writer.write(&0u32)?;
+        render_queue.write_buffer(
+            &buffer_cache.chunk_position_buffer,
+            0,
+            &value_data(&chunk.position)?,
+        );
         let num_vertices_buffer = buffers.get(&chunk.buffers.num_vertices).unwrap();
-        render_queue.write_buffer(&num_vertices_buffer.buffer, 0, writer.as_ref());
-
-        let mut writer = encase::StorageBuffer::<Vec<u8>>::new(Vec::new());
-        writer.write(&0u32)?;
+        render_queue.write_buffer(&num_vertices_buffer.buffer, 0, &value_data(&0u32)?);
         let num_triangles_buffer = buffers.get(&chunk.buffers.num_triangles).unwrap();
-        render_queue.write_buffer(&num_triangles_buffer.buffer, 0, writer.as_ref());
+        render_queue.write_buffer(&num_triangles_buffer.buffer, 0, &value_data(&0u32)?);
 
         dispatches.dispatches.push(buffer_cache);
     }
@@ -1099,34 +1204,41 @@ fn prepare_bind_groups<Sampler: ChunkComputeShader + Send + Sync + 'static>(
     Ok(())
 }
 
-#[derive(EntityEvent)]
-struct ReadbackReallyComplete(Entity);
+pub fn value_data<T: ShaderType + WriteInto>(value: &T) -> Result<Vec<u8>> {
+    let mut writer = encase::StorageBuffer::<Vec<u8>>::new(Vec::new());
+    writer.write(value)?;
+    Ok(writer.into_inner())
+}
 
-fn finish_chunk<Sampler: ChunkComputeShader + Send + Sync + 'static>(
+#[derive(EntityEvent)]
+pub struct ReadbackReallyComplete(pub Entity);
+
+fn finish_chunk<
+    Sampler: ChunkComputeShader + Send + Sync + 'static,
+    ExtraBufferCache: GpuExtraBufferCache + Send + Sync + 'static,
+>(
     readback: On<ReadbackReallyComplete>,
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut cache: ResMut<ChunkGeneratorCache<Sampler>>,
-    chunks: Query<(&ChunkRenderData<Sampler>, &ChunkGenData)>,
+    mut chunks: Query<(&mut ChunkRenderData<Sampler>, &ChunkGenData)>,
 ) -> Result {
-    let Ok((
-        &ChunkRenderData {
-            position: chunk_position,
-            ref buffers,
-            ..
-        },
-        chunk,
-    )) = chunks.get(readback.0)
-    else {
+    let Ok((mut chunk, chunk_gen)) = chunks.get_mut(readback.0) else {
         return Ok(()); // It's already done
     };
 
-    info!("finish_chunk {chunk_position}");
+    chunk.num_readbacks_done += 1;
 
-    let Some(ref vertices) = chunk.vertices else {
+    if chunk.num_readbacks_done < ExtraBufferCache::num_extra_readbacks() + 2 {
+        return Ok(());
+    }
+
+    trace!("finish_chunk {}", chunk.position);
+
+    let Some(ref vertices) = chunk_gen.vertices else {
         return Ok(());
     };
-    let Some(ref triangles) = chunk.triangles else {
+    let Some(ref triangles) = chunk_gen.triangles else {
         return Ok(());
     };
 
@@ -1158,8 +1270,8 @@ fn finish_chunk<Sampler: ChunkComputeShader + Send + Sync + 'static>(
     }
     cache
         .loaded_chunks
-        .insert(chunk_position, LoadState::Finished);
-    cache.return_buffer(buffers);
+        .insert(chunk.position, LoadState::Finished);
+    cache.return_buffer(chunk.buffers.clone());
 
     commands
         .entity(readback.0)
@@ -1178,12 +1290,17 @@ fn add_compute_render_graph_node(mut render_graph: ResMut<RenderGraph>) {
     );
 }
 
-fn clear_gpu_cache<Sampler: Send + Sync + 'static>(
+fn clear_gpu_cache<
+    Sampler: ChunkComputeShader + Send + Sync + 'static,
+    ExtraBufferCache: GpuExtraBufferCache + Send + Sync + 'static,
+>(
     settings: Res<ChunkGeneratorSettings<Sampler>>,
-    mut cache: ResMut<GpuChunkGeneratorCache<Sampler>>,
+    mut cache: ResMut<GpuChunkGeneratorCache<Sampler, ExtraBufferCache>>,
 ) {
     if settings.clear_gpu_cache {
         cache.buffer_cache.clear();
+        cache.extra_buffer_cache.clear();
+        cache.extra_buffer_needed_keys.clear();
     }
 }
 

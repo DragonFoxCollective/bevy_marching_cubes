@@ -14,6 +14,12 @@ var<uniform> settings: MeshSettings;
 @group(0) @binding(2)
 var<storage, read_write> densities: array<f32>;
 
+@group(0) @binding(3)
+var<uniform> poi_positions: array<vec3f, 1>;
+
+@group(0) @binding(4)
+var<storage, read_write> poi_positions_final: array<vec3f, 1>;
+
 fn coord_to_world(coord: vec3<u32>) -> vec3<f32> {
 	return (vec3<f32>(chunk_position) + (vec3<f32>(coord) - vec3<f32>(1.0)) / f32(settings.num_voxels_per_axis)) * settings.chunk_size;
 }
@@ -30,7 +36,9 @@ fn main(
 		return;
 	}
 
-	densities[density_index(coord)] = sample_noise(coord_to_world(coord) * 0.05);
+	let density = sample_noise(coord_to_world(coord) * 0.1);
+	poi_positions_final[0] = poi_positions[0] + vec3<f32>(density * 10.0);
+	densities[density_index(coord)] = density;
 }
 
 fn sample_noise(coord: vec3<f32>) -> f32 {
