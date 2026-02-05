@@ -1,6 +1,13 @@
 // Most of this code is from https://github.com/SebLague/Terraforming
 // with a hint of https://github.com/qhdwight/voxel-game-rs
 
+struct MeshSettings {
+    num_voxels_per_axis: u32,
+    num_samples_per_axis: u32,
+    chunk_size: f32,
+    surface_threshold: f32,
+}
+
 struct Vertex {
 	position: vec3<f32>,
 	normal: vec3<f32>,
@@ -16,36 +23,24 @@ struct Triangle {
 var<storage, read> densities: array<f32>;
 
 @group(0) @binding(1)
-var<uniform> num_voxels_per_axis: u32;
+var<uniform> settings: MeshSettings;
 
 @group(0) @binding(2)
-var<uniform> num_samples_per_axis: u32;
-
-@group(0) @binding(3)
-var<uniform> chunk_size: f32;
-
-@group(0) @binding(4)
-var<uniform> surface_threshold: f32;
-
-@group(0) @binding(5)
 var<storage, read_write> out_vertices: array<Vertex>;
-
-@group(0) @binding(6)
-var<storage, read_write> out_vertices_len: atomic<u32>;
-
-@group(0) @binding(7)
+@group(0) @binding(3)
+var<storage, read_write> out_num_vertices: atomic<u32>;
+@group(0) @binding(4)
 var<storage, read_write> out_triangles: array<Triangle>;
-
-@group(0) @binding(8)
-var<storage, read_write> out_triangles_len: atomic<u32>;
+@group(0) @binding(5)
+var<storage, read_write> out_num_triangles: atomic<u32>;
 
 fn coord_to_world(coord: vec3<i32>) -> vec3<f32> {
-	return vec3<f32>(coord) / vec3<f32>(num_voxels_per_axis) * chunk_size;
+	return vec3<f32>(coord) / vec3<f32>(settings.num_voxels_per_axis) * settings.chunk_size;
 }
 
 fn sample_density(coord: vec3<i32>) -> f32 {
 	let shifted_coord = coord + vec3<i32>(1, 1, 1); // Shift to account for the fact that we sample from the next chunk over too for normals
-	return densities[shifted_coord.x * i32(num_samples_per_axis) * i32(num_samples_per_axis) + shifted_coord.y * i32(num_samples_per_axis) + shifted_coord.z];
+	return densities[shifted_coord.x * i32(settings.num_samples_per_axis) * i32(settings.num_samples_per_axis) + shifted_coord.y * i32(settings.num_samples_per_axis) + shifted_coord.z];
 }
 
 fn calculate_normal(coord: vec3<i32>) -> vec3<f32> {
@@ -71,7 +66,7 @@ fn create_vertex(coord_a: vec3<i32>, coord_b: vec3<i32>) -> Vertex {
 	let density_b = sample_density(coord_b);
 
 	// Interpolate between the two corner points based on the density
-	let t = (surface_threshold - density_a) / (density_b - density_a);
+	let t = (settings.surface_threshold - density_a) / (density_b - density_a);
 	let position = pos_a + t * (pos_b - pos_a);
 
 	// Normal:
@@ -92,12 +87,7 @@ fn create_vertex(coord_a: vec3<i32>, coord_b: vec3<i32>) -> Vertex {
 fn main2(
 	@builtin(global_invocation_id) coord: vec3<u32>
 ) {
-	let _density = densities[0];
-	let _num_voxels_per_axis = num_voxels_per_axis;
-	let _chunk_size = chunk_size;
-	let _surface_threshold = surface_threshold;
-
-	let vertex_index = atomicAdd(&out_vertices_len, 3u);
+	let vertex_index = atomicAdd(&out_num_vertices, 3u);
 	out_vertices[vertex_index] = Vertex(
 		vec3<f32>(coord),
 		vec3<f32>(0.0, 1.0, 0.0),
@@ -111,7 +101,7 @@ fn main2(
 		vec3<f32>(0.0, 1.0, 0.0),
 	);
 
-	let triangle_index = atomicAdd(&out_triangles_len, 1u);
+	let triangle_index = atomicAdd(&out_num_triangles, 1u);
 	out_triangles[triangle_index] = Triangle(
 		u32(vertex_index),
 		u32(vertex_index + 1),
@@ -123,7 +113,7 @@ fn main2(
 fn main(
 	@builtin(global_invocation_id) coord: vec3<u32>
 ) {
-	if coord.x >= num_voxels_per_axis || coord.y >= num_voxels_per_axis || coord.z >= num_voxels_per_axis {
+	if coord.x >= settings.num_voxels_per_axis || coord.y >= settings.num_voxels_per_axis || coord.z >= settings.num_voxels_per_axis {
 		return;
 	}
 
@@ -149,7 +139,7 @@ fn main(
 		// Think of the configuration as an 8-bit binary number (each bit represents the state of a corner point).
 		// The state of each corner point is either 0: above the surface, or 1: below the surface.
 		// The code below sets the corresponding bit to 1, if the point is below the surface.
-		if sample_density(vec3<i32>(coord) + CORNER_COORDS[i]) < surface_threshold {
+		if sample_density(vec3<i32>(coord) + CORNER_COORDS[i]) < settings.surface_threshold {
 			cube_configuration |= 1u << u32(i);
 		}
 	}
@@ -180,7 +170,7 @@ fn main(
 	}
 
 	// Map the vertices and their indices to the output buffer.
-	var current_vertex_index = atomicAdd(&out_vertices_len, num_vertices);
+	var current_vertex_index = atomicAdd(&out_num_vertices, num_vertices);
 	for (var i = 0; i < 12; i++) {
 		// If the edge has not been created, skip it.
 		if !edge_vertices_created[i] { continue; }
@@ -195,7 +185,7 @@ fn main(
 	}
 
 	// Create triangles for the current cube configuration
-	var current_triangle_index = atomicAdd(&out_triangles_len, num_vertices_for_triangles / 3);
+	var current_triangle_index = atomicAdd(&out_num_triangles, num_vertices_for_triangles / 3);
 	for (var i = 0; i < 15; i += 3) {
 		// If edge index is -1, then no further vertices exist in this configuration
 		if edge_indices[i] == -1 { break; }

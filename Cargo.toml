@@ -1,15 +1,17 @@
 [package]
 name = "bevy_marching_cubes"
-version = "0.2.0"
-edition = "2021"
+version = "0.3.0"
+edition = "2024"
+
+[lints.clippy]
+too_many_arguments = "allow"
 
 [dependencies]
 bevy = { version = "0.17", default-features = false, features = [
 	"bevy_render",
 ] }
-bevy_app_compute = { git = "https://github.com/jwright159/bevy_app_compute.git" }
-bytemuck = "1.23.1"
+encase = "0.11.2" # match bevy_render
 
 [dev-dependencies]
-bevy = "0.17"
+bevy = { version = "0.17", features = ["track_location"] }
 bevy_panorbit_camera = "0.29"

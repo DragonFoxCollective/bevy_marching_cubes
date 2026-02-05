@@ -1,35 +1,44 @@
+struct MeshSettings {
+    num_voxels_per_axis: u32,
+    num_samples_per_axis: u32,
+    chunk_size: f32,
+    surface_threshold: f32,
+}
+
 @group(0) @binding(0)
 var<uniform> chunk_position: vec3<i32>;
 
 @group(0) @binding(1)
-var<uniform> num_voxels_per_axis: u32;
+var<uniform> settings: MeshSettings;
 
 @group(0) @binding(2)
-var<uniform> num_samples_per_axis: u32;
-
-@group(0) @binding(3)
-var<uniform> chunk_size: f32;
-
-@group(0) @binding(4)
 var<storage, read_write> densities: array<f32>;
 
+@group(0) @binding(3)
+var<uniform> poi_positions: array<vec3f, 1>;
+
+@group(0) @binding(4)
+var<storage, read_write> poi_positions_final: array<vec3f, 1>;
+
 fn coord_to_world(coord: vec3<u32>) -> vec3<f32> {
-	return (vec3<f32>(chunk_position) + (vec3<f32>(coord) - vec3<f32>(1.0)) / f32(num_voxels_per_axis)) * chunk_size;
+	return (vec3<f32>(chunk_position) + (vec3<f32>(coord) - vec3<f32>(1.0)) / f32(settings.num_voxels_per_axis)) * settings.chunk_size;
 }
 
 fn density_index(coord: vec3<u32>) -> u32 {
-	return coord.x * num_samples_per_axis * num_samples_per_axis + coord.y * num_samples_per_axis + coord.z;
+	return coord.x * settings.num_samples_per_axis * settings.num_samples_per_axis + coord.y * settings.num_samples_per_axis + coord.z;
 }
 
 @compute @workgroup_size(8, 8, 8)
 fn main(
 	@builtin(global_invocation_id) coord: vec3<u32>
 ) {
-	if coord.x >= num_samples_per_axis || coord.y >= num_samples_per_axis || coord.z >= num_samples_per_axis {
+	if coord.x >= settings.num_samples_per_axis || coord.y >= settings.num_samples_per_axis || coord.z >= settings.num_samples_per_axis {
 		return;
 	}
 
-	densities[density_index(coord)] = sample_noise(coord_to_world(coord) * 0.1);
+	let density = sample_noise(coord_to_world(coord) * 0.1);
+	poi_positions_final[0] = poi_positions[0] + vec3<f32>(density * 10.0);
+	densities[density_index(coord)] = density;
 }
 
 fn sample_noise(coord: vec3<f32>) -> f32 {
