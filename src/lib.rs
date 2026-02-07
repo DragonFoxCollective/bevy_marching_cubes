@@ -527,6 +527,12 @@ impl<Sampler: Send + Sync + 'static> ChunkGeneratorSettings<Sampler> {
     }
 }
 
+pub fn is_generator_running<Sampler: Send + Sync + 'static>(
+    settings: Res<ChunkGeneratorSettings<Sampler>>,
+) -> bool {
+    matches!(settings.running, ChunkGeneratorRunning::Run)
+}
+
 #[derive(Resource, Debug, Clone)]
 pub struct ChunkGeneratorCache<Sampler> {
     loaded_chunks: HashMap<IVec3, LoadState>,
