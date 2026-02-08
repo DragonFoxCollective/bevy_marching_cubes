@@ -14,7 +14,7 @@ use bevy::render::render_resource::binding_types::{
     storage_buffer, storage_buffer_read_only, storage_buffer_sized, uniform_buffer,
 };
 use bevy::render::render_resource::{
-    BindGroup, BindGroupEntries, BindGroupEntry, BindGroupLayout, BindGroupLayoutEntries,
+    BindGroup, BindGroupEntries, BindGroupEntry, BindGroupLayoutDescriptor, BindGroupLayoutEntries,
     BindGroupLayoutEntryBuilder, Buffer, BufferUsages, CachedComputePipelineId,
     ComputePassDescriptor, ComputePipelineDescriptor, PipelineCache, ShaderStages, ShaderType,
     StorageBuffer, UniformBuffer,
@@ -231,9 +231,9 @@ impl render_graph::Node for ChunkGeneratorNode {
 
 #[derive(Resource)]
 struct ChunkGeneratorComputePipelines<Sampler> {
-    sample_layout: BindGroupLayout,
+    sample_layout: BindGroupLayoutDescriptor,
     sample_pipeline: CachedComputePipelineId,
-    march_layout: BindGroupLayout,
+    march_layout: BindGroupLayoutDescriptor,
     march_pipeline: CachedComputePipelineId,
     _marker: std::marker::PhantomData<Sampler>,
 }
@@ -243,7 +243,6 @@ fn init_compute_pipelines<
     ExtraBufferCache: GpuExtraBufferCache + Send + Sync + 'static,
 >(
     mut commands: Commands,
-    render_device: Res<RenderDevice>,
     asset_server: Res<AssetServer>,
     pipeline_cache: Res<PipelineCache>,
     settings: Res<ChunkGeneratorSettings<Sampler>>,
@@ -253,7 +252,7 @@ fn init_compute_pipelines<
 
     pipelines_done_loading.done = false;
 
-    let sample_layout = render_device.create_bind_group_layout(
+    let sample_layout = BindGroupLayoutDescriptor::new(
         "marching cubes sample bind group layout",
         &[
             uniform_buffer::<IVec3>(false),
@@ -279,7 +278,7 @@ fn init_compute_pipelines<
         ..default()
     });
 
-    let march_layout = render_device.create_bind_group_layout(
+    let march_layout = BindGroupLayoutDescriptor::new(
         "marching cubes march bind group layout",
         &BindGroupLayoutEntries::sequential(
             ShaderStages::COMPUTE,
@@ -787,6 +786,7 @@ impl GpuBufferCache {
         render_queue: &RenderQueue,
         buffers: &RenderAssets<GpuShaderStorageBuffer>,
         pipelines: &ChunkGeneratorComputePipelines<Sampler>,
+        pipeline_cache: &PipelineCache,
     ) -> Self {
         let num_voxels_per_axis = settings.num_voxels_per_axis;
         let num_samples_per_axis = settings.num_samples_per_axis();
@@ -820,7 +820,7 @@ impl GpuBufferCache {
 
         let sample_bind_group = render_device.create_bind_group(
             Some("marching cubes sample bind group"),
-            &pipelines.sample_layout,
+            &pipeline_cache.get_bind_group_layout(&pipelines.sample_layout),
             &[
                 chunk_position_buffer.binding().unwrap(),
                 settings_buffer.binding().unwrap(),
@@ -843,7 +843,7 @@ impl GpuBufferCache {
 
         let march_bind_group = render_device.create_bind_group(
             Some("marching cubes march bind group"),
-            &pipelines.march_layout,
+            &pipeline_cache.get_bind_group_layout(&pipelines.march_layout),
             &BindGroupEntries::sequential((
                 densities_buffer.binding().unwrap(),
                 settings_buffer.binding().unwrap(),
@@ -1163,6 +1163,7 @@ fn prepare_bind_groups<
     pipelines: Res<ChunkGeneratorComputePipelines<Sampler>>,
     mut dispatches: ResMut<ChunkGeneratorDispatches>,
     mut cache: ResMut<GpuChunkGeneratorCache<Sampler, ExtraBufferCache>>,
+    pipeline_cache: Res<PipelineCache>,
 ) -> Result<()> {
     for chunk in chunks.iter() {
         let extra_buffers = cache
@@ -1190,6 +1191,7 @@ fn prepare_bind_groups<
                     &render_queue,
                     &buffers,
                     &pipelines,
+                    &pipeline_cache,
                 )
             })
             .clone();

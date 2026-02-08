@@ -1,17 +1,17 @@
 [package]
 name = "bevy_marching_cubes"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
+
+[dependencies]
+bevy = { version = "0.18", default-features = false, features = [
+  "bevy_render",
+] }
+encase = "0.12"  # match bevy_render
+
+[dev-dependencies]
+bevy = { version = "0.18", features = ["track_location"] }
+bevy_panorbit_camera = "0.34"
 
 [lints.clippy]
 too_many_arguments = "allow"
-
-[dependencies]
-bevy = { version = "0.17", default-features = false, features = [
-	"bevy_render",
-] }
-encase = "0.11.2" # match bevy_render
-
-[dev-dependencies]
-bevy = { version = "0.17", features = ["track_location"] }
-bevy_panorbit_camera = "0.29"
